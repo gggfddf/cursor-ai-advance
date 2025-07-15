@@ -23,6 +23,188 @@ logger = logging.getLogger(__name__)
 
 warnings.filterwarnings('ignore')
 
+# Install openpyxl if not available
+try:
+    import openpyxl
+except ImportError:
+    import subprocess
+    subprocess.run(['pip', 'install', 'openpyxl'], check=True)
+    import openpyxl
+
+class TradingStrategy:
+    """Trading strategy class with configurable parameters."""
+    
+    def __init__(self, initial_balance=500, leverage=200, stop_loss_pct=0.02, take_profit_pct=0.04):
+        self.initial_balance = initial_balance
+        self.leverage = leverage
+        self.stop_loss_pct = stop_loss_pct
+        self.take_profit_pct = take_profit_pct
+        self.balance = initial_balance
+        self.trades = []
+        self.position = None  # None, 'long', 'short'
+        self.position_size = 0
+        self.entry_price = 0
+        self.entry_date = None
+        
+    def calculate_position_size(self, price):
+        """Calculate position size based on balance and leverage."""
+        return (self.balance * self.leverage) / price
+        
+    def open_position(self, signal, price, date):
+        """Open a new position based on signal."""
+        if self.position is not None:
+            return  # Already in position
+            
+        if signal == 1:  # Buy signal
+            self.position = 'long'
+            self.position_size = self.calculate_position_size(price)
+            self.entry_price = price
+            self.entry_date = date
+            
+        elif signal == 0:  # Sell signal (short)
+            self.position = 'short'
+            self.position_size = self.calculate_position_size(price)
+            self.entry_price = price
+            self.entry_date = date
+            
+    def close_position(self, price, date, reason='signal'):
+        """Close current position and record trade."""
+        if self.position is None:
+            return
+            
+        if self.position == 'long':
+            pnl = (price - self.entry_price) * self.position_size
+        else:  # short
+            pnl = (self.entry_price - price) * self.position_size
+            
+        self.balance += pnl
+        
+        trade = {
+            'entry_date': self.entry_date,
+            'exit_date': date,
+            'position': self.position,
+            'entry_price': self.entry_price,
+            'exit_price': price,
+            'position_size': self.position_size,
+            'pnl': pnl,
+            'balance': self.balance,
+            'return_pct': (pnl / self.initial_balance) * 100,
+            'close_reason': reason
+        }
+        
+        self.trades.append(trade)
+        
+        # Reset position
+        self.position = None
+        self.position_size = 0
+        self.entry_price = 0
+        self.entry_date = None
+        
+    def check_stop_loss_take_profit(self, price, date):
+        """Check if stop loss or take profit should be triggered."""
+        if self.position is None:
+            return False
+            
+        if self.position == 'long':
+            # Stop loss
+            if price <= self.entry_price * (1 - self.stop_loss_pct):
+                self.close_position(price, date, 'stop_loss')
+                return True
+            # Take profit
+            elif price >= self.entry_price * (1 + self.take_profit_pct):
+                self.close_position(price, date, 'take_profit')
+                return True
+                
+        elif self.position == 'short':
+            # Stop loss
+            if price >= self.entry_price * (1 + self.stop_loss_pct):
+                self.close_position(price, date, 'stop_loss')
+                return True
+            # Take profit
+            elif price <= self.entry_price * (1 - self.take_profit_pct):
+                self.close_position(price, date, 'take_profit')
+                return True
+                
+        return False
+        
+    def execute_strategy(self, data, predictions):
+        """Execute the trading strategy based on predictions."""
+        for i in range(len(data)):
+            if i < len(predictions):
+                current_price = data.iloc[i]['close']
+                current_date = data.index[i] if hasattr(data.index, '__getitem__') else i
+                
+                # Check stop loss/take profit first
+                if not self.check_stop_loss_take_profit(current_price, current_date):
+                    # Check for new signals
+                    signal = predictions[i]
+                    
+                    if self.position is None:
+                        # Open new position
+                        self.open_position(signal, current_price, current_date)
+                    elif (self.position == 'long' and signal == 0) or (self.position == 'short' and signal == 1):
+                        # Close current position and open new one
+                        self.close_position(current_price, current_date, 'signal_change')
+                        self.open_position(signal, current_price, current_date)
+                        
+        # Close any remaining position at the end
+        if self.position is not None:
+            final_price = data.iloc[-1]['close']
+            final_date = data.index[-1] if hasattr(data.index, '__getitem__') else len(data)-1
+            self.close_position(final_price, final_date, 'end_of_data')
+            
+    def get_trade_statistics(self):
+        """Calculate trading statistics."""
+        if not self.trades:
+            return {}
+            
+        df_trades = pd.DataFrame(self.trades)
+        
+        stats = {
+            'total_trades': len(self.trades),
+            'winning_trades': len(df_trades[df_trades['pnl'] > 0]),
+            'losing_trades': len(df_trades[df_trades['pnl'] <= 0]),
+            'win_rate': len(df_trades[df_trades['pnl'] > 0]) / len(self.trades) * 100,
+            'total_pnl': df_trades['pnl'].sum(),
+            'average_pnl': df_trades['pnl'].mean(),
+            'max_profit': df_trades['pnl'].max(),
+            'max_loss': df_trades['pnl'].min(),
+            'final_balance': self.balance,
+            'total_return': ((self.balance - self.initial_balance) / self.initial_balance) * 100
+        }
+        
+        return stats
+        
+    def export_trades_to_csv(self, filename='trades.csv'):
+        """Export all trades to CSV file."""
+        if not self.trades:
+            print("No trades to export")
+            return
+            
+        df_trades = pd.DataFrame(self.trades)
+        df_trades.to_csv(filename, index=False)
+        print(f"Trades exported to {filename}")
+        
+    def export_trades_to_excel(self, filename='trades.xlsx'):
+        """Export all trades to Excel file."""
+        if not self.trades:
+            print("No trades to export")
+            return
+            
+        df_trades = pd.DataFrame(self.trades)
+        
+        # Create Excel writer
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            # Write trades to one sheet
+            df_trades.to_excel(writer, sheet_name='Trades', index=False)
+            
+            # Write statistics to another sheet
+            stats = self.get_trade_statistics()
+            stats_df = pd.DataFrame(list(stats.items()), columns=['Metric', 'Value'])
+            stats_df.to_excel(writer, sheet_name='Statistics', index=False)
+            
+        print(f"Trades exported to {filename}")
+
 class RobustXAUUSDModel:
     def __init__(self, data_file='XAU_1d_data_clean.csv'):
         self.data_file = data_file
@@ -31,6 +213,7 @@ class RobustXAUUSDModel:
         self.scaler = StandardScaler()
         self.feature_cols = []
         self.data = None
+        self.trading_strategy = TradingStrategy(initial_balance=500, leverage=200)
         
     def load_and_validate_data(self):
         """Load and validate the input data with proper error handling."""
@@ -513,43 +696,74 @@ class RobustXAUUSDModel:
             logger.error(f"Error generating feature importance: {e}")
             return False
     
-    def predict_recent(self, n_days=10):
+    def predict_recent(self, n_predictions=10):
         """Make predictions on the most recent data."""
         try:
             if self.model is None:
                 logger.error("Model not trained yet")
                 return None
                 
-            # Get recent data
-            recent_data = self.data.tail(n_days).copy()
-            recent_features = recent_data[self.feature_cols]
-            
-            # Make predictions
-            predictions = self.model.predict(recent_features)
-            probabilities = self.model.predict_proba(recent_features)[:, 1]
+            # Get recent data for predictions
+            recent_data = self.data[self.feature_cols].tail(n_predictions)
+            recent_predictions = self.model.predict(recent_data)
+            recent_proba = self.model.predict_proba(recent_data)
             
             # Create results dataframe
-            result_cols = ['open', 'high', 'low', 'close', 'volume']
-            if 'date' in recent_data.columns:
-                result_cols.insert(0, 'date')
-                
-            results = recent_data[result_cols].copy()
-            results['predicted'] = predictions
-            results['probability'] = probabilities.round(4)
+            results = pd.DataFrame({
+                'prediction': recent_predictions,
+                'probability_down': recent_proba[:, 0],
+                'probability_up': recent_proba[:, 1],
+                'date': self.data.tail(n_predictions).index if hasattr(self.data, 'index') else range(len(self.data) - n_predictions, len(self.data))
+            })
             
-            if 'target' in recent_data.columns:
-                results['actual'] = recent_data['target']
-                
-            print(f"\n{'='*70}")
-            print(f"PREDICTIONS FOR LAST {n_days} DAYS")
-            print(f"{'='*70}")
-            print(results.to_string(index=False))
-            
+            logger.info(f"Generated {len(results)} recent predictions")
             return results
             
         except Exception as e:
-            logger.error(f"Error making recent predictions: {e}")
+            logger.error(f"Error in recent predictions: {e}")
             return None
+            
+    def execute_trading_strategy(self):
+        """Execute the trading strategy based on model predictions."""
+        try:
+            if self.model is None:
+                logger.error("Model not trained yet")
+                return False
+                
+            # Get predictions for the entire test set
+            X_test = self.data[self.feature_cols].iloc[len(self.X_train):]
+            test_predictions = self.model.predict(X_test)
+            test_data = self.data.iloc[len(self.X_train):]
+            
+            # Execute trading strategy
+            self.trading_strategy.execute_strategy(test_data, test_predictions)
+            
+            # Print trading statistics
+            stats = self.trading_strategy.get_trade_statistics()
+            if stats:
+                print(f"\n{'='*60}")
+                print("TRADING STRATEGY RESULTS")
+                print(f"{'='*60}")
+                print(f"Initial Balance: ${self.trading_strategy.initial_balance}")
+                print(f"Leverage: {self.trading_strategy.leverage}x")
+                print(f"Final Balance: ${stats['final_balance']:.2f}")
+                print(f"Total Return: {stats['total_return']:.2f}%")
+                print(f"Total Trades: {stats['total_trades']}")
+                print(f"Win Rate: {stats['win_rate']:.2f}%")
+                print(f"Average P&L per Trade: ${stats['average_pnl']:.2f}")
+                print(f"Max Profit: ${stats['max_profit']:.2f}")
+                print(f"Max Loss: ${stats['max_loss']:.2f}")
+                print(f"{'='*60}")
+                
+                # Export trades to CSV and Excel
+                self.trading_strategy.export_trades_to_csv('xauusd_trades.csv')
+                self.trading_strategy.export_trades_to_excel('xauusd_trades.xlsx')
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error executing trading strategy: {e}")
+            return False
     
     def generate_comprehensive_report(self):
         """Generate a comprehensive analysis report."""
@@ -687,50 +901,57 @@ Actual    0   {confusion_matrix(self.y_test, self.y_pred)[0,0]}   {confusion_mat
         return interpretations.get(feature_name, 'market microstructure behavior')
     
     def run_complete_analysis(self):
-        """Run the complete analysis pipeline."""
+        """Run the complete analysis pipeline including trading strategy."""
         try:
-            print("?? Starting XAUUSD ML Analysis Pipeline...")
+            print("🚀 Starting XAUUSD ML Analysis Pipeline with Trading Strategy...")
             
             # Step 1: Load and validate data
             if not self.load_and_validate_data():
                 return False
-            print("? Data loaded and validated")
+            print("✅ Data loaded and validated")
             
             # Step 2: Feature engineering
             if not self.prepare_features():
                 return False
-            print("? Features engineered")
+            print("✅ Features engineered")
             
             # Step 3: Create target
             if not self.create_target():
                 return False
-            print("? Target variable created")
+            print("✅ Target variable created")
             
             # Step 4: Train model
             if not self.train_model():
                 return False
-            print("? Model trained and evaluated")
+            print("✅ Model trained and evaluated")
             
-            # Step 5: Feature importance analysis
+            # Step 5: Execute trading strategy
+            if not self.execute_trading_strategy():
+                return False
+            print("✅ Trading strategy executed")
+            
+            # Step 6: Feature importance analysis
             if not self.generate_feature_importance():
                 return False
-            print("? Feature importance analysis completed")
+            print("✅ Feature importance analysis completed")
             
-            # Step 6: Recent predictions
+            # Step 7: Recent predictions
             recent_predictions = self.predict_recent()
             if recent_predictions is not None:
-                print("? Recent predictions generated")
+                print("✅ Recent predictions generated")
             
-            # Step 7: Generate comprehensive report
+            # Step 8: Generate comprehensive report
             if not self.generate_comprehensive_report():
                 return False
-            print("? Comprehensive report generated")
+            print("✅ Comprehensive report generated")
             
-            print(f"\n?? Analysis Complete! Files generated:")
-            print("?? confusion_matrix.png")
-            print("?? shap_feature_importance.png (if applicable)")
-            print("?? feature_importance.json")
-            print("?? XAUUSD_ML_Report.md")
+            print(f"\n🎯 Analysis Complete! Files generated:")
+            print("📊 confusion_matrix.png")
+            print("📊 shap_feature_importance.png (if applicable)")
+            print("📊 feature_importance.json")
+            print("📊 XAUUSD_ML_Report.md")
+            print("💰 xauusd_trades.csv")
+            print("💰 xauusd_trades.xlsx")
             
             return True
             

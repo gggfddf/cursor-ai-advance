@@ -34,149 +34,141 @@ except ImportError:
 class TradingStrategy:
     """Trading strategy class with configurable parameters."""
     
-    def __init__(self, initial_balance=500, leverage=200, stop_loss_pct=0.02, take_profit_pct=0.04):
+    def __init__(self, initial_balance=100000, leverage=1, stop_loss_pct=0.015, take_profit_pct=0.03, 
+                 min_confidence=0.6, max_positions=3, risk_per_trade=0.02):
         self.initial_balance = initial_balance
         self.leverage = leverage
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
+        self.min_confidence = min_confidence
+        self.max_positions = max_positions
+        self.risk_per_trade = risk_per_trade
         self.balance = initial_balance
         self.trades = []
-        self.position = None  # None, 'long', 'short'
-        self.position_size = 0
-        self.entry_price = 0
-        self.entry_date = None
+        self.positions = []  # List to hold multiple positions
         
     def calculate_position_size(self, price):
-        """Calculate position size based on balance and leverage."""
-        if self.leverage == 1:
-            # No leverage - use available balance directly
-            return self.balance / price
-        else:
-            # With leverage - use a percentage of balance to avoid excessive risk
-            risk_per_trade = min(self.balance * 0.02, self.balance)  # Risk max 2% of balance per trade
-            return (risk_per_trade * self.leverage) / price
+        """Calculate position size based on balance, risk per trade, and leverage."""
+        risk_amount = self.balance * self.risk_per_trade
+        return (risk_amount * self.leverage) / price
         
-    def open_position(self, signal, price, date):
-        """Open a new position based on signal."""
-        if self.position is not None:
-            return  # Already in position
+    def get_active_positions(self):
+        """Get currently active positions."""
+        return [pos for pos in self.positions if pos['status'] == 'active']
+        
+    def open_position(self, signal, price, date, confidence=None):
+        """Open a new position based on signal and confidence."""
+        # Check if we have confidence score and if it meets threshold
+        if confidence is not None and confidence < self.min_confidence:
+            return  # Skip low confidence signals
             
+        # Check if we already have max positions
+        active_positions = self.get_active_positions()
+        if len(active_positions) >= self.max_positions:
+            return  # Already at max positions
+            
+        # Check if we already have a position in the same direction
         if signal == 1:  # Buy signal
-            self.position = 'long'
-            self.position_size = self.calculate_position_size(price)
-            self.entry_price = price
-            self.entry_date = date
-            
+            position_type = 'long'
         elif signal == 0:  # Sell signal (short)
-            self.position = 'short'
-            self.position_size = self.calculate_position_size(price)
-            self.entry_price = price
-            self.entry_date = date
-            
-    def close_position(self, price, date, reason='signal'):
-        """Close current position and record trade."""
-        if self.position is None:
+            position_type = 'short'
+        else:
             return
             
-        if self.position == 'long':
-            if self.leverage == 1:
-                # No leverage - simple calculation
-                pnl = (price - self.entry_price) * self.position_size
-            else:
-                # With leverage - calculate based on price change percentage
-                price_change_pct = (price - self.entry_price) / self.entry_price
-                risk_amount = min(self.balance * 0.02, self.balance)  # Max 2% risk per trade
-                pnl = risk_amount * price_change_pct * self.leverage
-        else:  # short
-            if self.leverage == 1:
-                # No leverage - simple calculation
-                pnl = (self.entry_price - price) * self.position_size
-            else:
-                # With leverage - calculate based on price change percentage
-                price_change_pct = (self.entry_price - price) / self.entry_price
-                risk_amount = min(self.balance * 0.02, self.balance)  # Max 2% risk per trade
-                pnl = risk_amount * price_change_pct * self.leverage
+        # Check if we already have this position type
+        same_direction_positions = [pos for pos in active_positions if pos['position'] == position_type]
+        if len(same_direction_positions) > 0:
+            return  # Already have position in this direction
+            
+        position = {
+            'id': len(self.trades),
+            'entry_date': date,
+            'position': position_type,
+            'entry_price': price,
+            'position_size': self.calculate_position_size(price),
+            'status': 'active',
+            'confidence': confidence
+        }
         
-        # Prevent balance from going negative
-        if self.balance + pnl < 0:
-            pnl = -self.balance + 1  # Leave $1 to continue trading
+        self.positions.append(position)
+        
+    def close_position(self, position, price, date, reason='signal'):
+        """Close a specific position and record trade."""
+        if position['status'] != 'active':
+            return
+            
+        if position['position'] == 'long':
+            pnl = (price - position['entry_price']) * position['position_size']
+        else:  # short
+            pnl = (position['entry_price'] - price) * position['position_size']
             
         self.balance += pnl
         
         trade = {
-            'entry_date': self.entry_date,
+            'entry_date': position['entry_date'],
             'exit_date': date,
-            'position': self.position,
-            'entry_price': self.entry_price,
+            'position': position['position'],
+            'entry_price': position['entry_price'],
             'exit_price': price,
-            'position_size': self.position_size,
+            'position_size': position['position_size'],
             'pnl': pnl,
             'balance': self.balance,
             'return_pct': (pnl / self.initial_balance) * 100,
-            'close_reason': reason
+            'close_reason': reason,
+            'confidence': position.get('confidence', 0)
         }
         
         self.trades.append(trade)
-        
-        # Reset position
-        self.position = None
-        self.position_size = 0
-        self.entry_price = 0
-        self.entry_date = None
+        position['status'] = 'closed'
         
     def check_stop_loss_take_profit(self, price, date):
-        """Check if stop loss or take profit should be triggered."""
-        if self.position is None:
-            return False
-            
-        if self.position == 'long':
-            # Stop loss
-            if price <= self.entry_price * (1 - self.stop_loss_pct):
-                self.close_position(price, date, 'stop_loss')
-                return True
-            # Take profit
-            elif price >= self.entry_price * (1 + self.take_profit_pct):
-                self.close_position(price, date, 'take_profit')
-                return True
-                
-        elif self.position == 'short':
-            # Stop loss
-            if price >= self.entry_price * (1 + self.stop_loss_pct):
-                self.close_position(price, date, 'stop_loss')
-                return True
-            # Take profit
-            elif price <= self.entry_price * (1 - self.take_profit_pct):
-                self.close_position(price, date, 'take_profit')
-                return True
-                
-        return False
+        """Check if stop loss or take profit should be triggered for all positions."""
+        active_positions = self.get_active_positions()
         
-    def execute_strategy(self, data, predictions):
-        """Execute the trading strategy based on predictions."""
+        for position in active_positions:
+            if position['position'] == 'long':
+                # Stop loss
+                if price <= position['entry_price'] * (1 - self.stop_loss_pct):
+                    self.close_position(position, price, date, 'stop_loss')
+                # Take profit
+                elif price >= position['entry_price'] * (1 + self.take_profit_pct):
+                    self.close_position(position, price, date, 'take_profit')
+                    
+            elif position['position'] == 'short':
+                # Stop loss
+                if price >= position['entry_price'] * (1 + self.stop_loss_pct):
+                    self.close_position(position, price, date, 'stop_loss')
+                # Take profit
+                elif price <= position['entry_price'] * (1 - self.take_profit_pct):
+                    self.close_position(position, price, date, 'take_profit')
+                    
+    def execute_strategy(self, data, predictions, confidence_scores=None):
+        """Execute the trading strategy based on predictions and confidence scores."""
         for i in range(len(data)):
             if i < len(predictions):
                 current_price = data.iloc[i]['close']
                 current_date = data.index[i] if hasattr(data.index, '__getitem__') else i
                 
                 # Check stop loss/take profit first
-                if not self.check_stop_loss_take_profit(current_price, current_date):
-                    # Check for new signals
-                    signal = predictions[i]
-                    
-                    if self.position is None:
-                        # Open new position
-                        self.open_position(signal, current_price, current_date)
-                    elif (self.position == 'long' and signal == 0) or (self.position == 'short' and signal == 1):
-                        # Close current position and open new one
-                        self.close_position(current_price, current_date, 'signal_change')
-                        self.open_position(signal, current_price, current_date)
-                        
-        # Close any remaining position at the end
-        if self.position is not None:
+                self.check_stop_loss_take_profit(current_price, current_date)
+                
+                # Get confidence score if available
+                confidence = None
+                if confidence_scores is not None and i < len(confidence_scores):
+                    confidence = confidence_scores[i]
+                
+                # Check for new signals
+                signal = predictions[i]
+                self.open_position(signal, current_price, current_date, confidence)
+                
+        # Close any remaining positions at the end
+        active_positions = self.get_active_positions()
+        if active_positions:
             final_price = data.iloc[-1]['close']
             final_date = data.index[-1] if hasattr(data.index, '__getitem__') else len(data)-1
-            self.close_position(final_price, final_date, 'end_of_data')
-            
+            for position in active_positions:
+                self.close_position(position, final_price, final_date, 'end_of_data')
+                
     def get_trade_statistics(self):
         """Calculate trading statistics."""
         if not self.trades:
@@ -184,17 +176,31 @@ class TradingStrategy:
             
         df_trades = pd.DataFrame(self.trades)
         
+        winning_trades = df_trades[df_trades['pnl'] > 0]
+        losing_trades = df_trades[df_trades['pnl'] <= 0]
+        
+        avg_win = winning_trades['pnl'].mean() if len(winning_trades) > 0 else 0
+        avg_loss = losing_trades['pnl'].mean() if len(losing_trades) > 0 else 0
+        
+        # Calculate profit factor
+        total_wins = winning_trades['pnl'].sum() if len(winning_trades) > 0 else 0
+        total_losses = abs(losing_trades['pnl'].sum()) if len(losing_trades) > 0 else 1
+        profit_factor = total_wins / total_losses if total_losses > 0 else 0
+        
         stats = {
             'total_trades': len(self.trades),
-            'winning_trades': len(df_trades[df_trades['pnl'] > 0]),
-            'losing_trades': len(df_trades[df_trades['pnl'] <= 0]),
-            'win_rate': len(df_trades[df_trades['pnl'] > 0]) / len(self.trades) * 100,
+            'winning_trades': len(winning_trades),
+            'losing_trades': len(losing_trades),
+            'win_rate': len(winning_trades) / len(self.trades) * 100,
             'total_pnl': df_trades['pnl'].sum(),
             'average_pnl': df_trades['pnl'].mean(),
+            'average_win': avg_win,
+            'average_loss': avg_loss,
             'max_profit': df_trades['pnl'].max(),
             'max_loss': df_trades['pnl'].min(),
             'final_balance': self.balance,
-            'total_return': ((self.balance - self.initial_balance) / self.initial_balance) * 100
+            'total_return': ((self.balance - self.initial_balance) / self.initial_balance) * 100,
+            'profit_factor': profit_factor
         }
         
         return stats
@@ -237,7 +243,7 @@ class RobustXAUUSDModel:
         self.scaler = StandardScaler()
         self.feature_cols = []
         self.data = None
-        self.trading_strategy = TradingStrategy(initial_balance=500, leverage=200)
+        self.trading_strategy = TradingStrategy()  # Use default parameters (Previous Settings)
         
     def load_and_validate_data(self):
         """Load and validate the input data with proper error handling."""
@@ -757,10 +763,15 @@ class RobustXAUUSDModel:
             # Get predictions for the entire test set
             X_test = self.data[self.feature_cols].iloc[len(self.X_train):]
             test_predictions = self.model.predict(X_test)
+            test_probabilities = self.model.predict_proba(X_test)
+            
+            # Generate confidence scores (use the higher probability)
+            confidence_scores = np.maximum(test_probabilities[:, 0], test_probabilities[:, 1])
+            
             test_data = self.data.iloc[len(self.X_train):]
             
-            # Execute trading strategy
-            self.trading_strategy.execute_strategy(test_data, test_predictions)
+            # Execute trading strategy with confidence scores
+            self.trading_strategy.execute_strategy(test_data, test_predictions, confidence_scores)
             
             # Print trading statistics
             stats = self.trading_strategy.get_trade_statistics()
@@ -768,15 +779,17 @@ class RobustXAUUSDModel:
                 print(f"\n{'='*60}")
                 print("TRADING STRATEGY RESULTS")
                 print(f"{'='*60}")
-                print(f"Initial Balance: ${self.trading_strategy.initial_balance}")
-                print(f"Leverage: {self.trading_strategy.leverage}x")
-                print(f"Final Balance: ${stats['final_balance']:.2f}")
+                print(f"Initial Balance: ${self.trading_strategy.initial_balance:,.2f}")
+                print(f"Final Balance: ${stats['final_balance']:,.2f}")
                 print(f"Total Return: {stats['total_return']:.2f}%")
+                print(f"Total P&L: ${stats['total_pnl']:,.2f}")
                 print(f"Total Trades: {stats['total_trades']}")
                 print(f"Win Rate: {stats['win_rate']:.2f}%")
-                print(f"Average P&L per Trade: ${stats['average_pnl']:.2f}")
-                print(f"Max Profit: ${stats['max_profit']:.2f}")
-                print(f"Max Loss: ${stats['max_loss']:.2f}")
+                print(f"Profit Factor: {stats['profit_factor']:.2f}")
+                print(f"Average Win: ${stats['average_win']:,.2f}")
+                print(f"Average Loss: ${stats['average_loss']:,.2f}")
+                print(f"Max Profit: ${stats['max_profit']:,.2f}")
+                print(f"Max Loss: ${stats['max_loss']:,.2f}")
                 print(f"{'='*60}")
                 
                 # Export trades to CSV and Excel
@@ -788,6 +801,148 @@ class RobustXAUUSDModel:
         except Exception as e:
             logger.error(f"Error executing trading strategy: {e}")
             return False
+
+    def test_multiple_configurations(self):
+        """Test multiple trading configurations to compare results."""
+        configurations = [
+            {
+                'name': 'Previous Settings (Full Dataset)',
+                'initial_balance': 100000,
+                'leverage': 1,
+                'stop_loss_pct': 0.015,  # 1.5%
+                'take_profit_pct': 0.03,  # 3.0%
+                'min_confidence': 0.6,    # 60%
+                'max_positions': 3,
+                'risk_per_trade': 0.02,   # 2%
+                'use_full_dataset': True
+            },
+            {
+                'name': 'Previous Settings (Test Set Only)',
+                'initial_balance': 100000,
+                'leverage': 1,
+                'stop_loss_pct': 0.015,  # 1.5%
+                'take_profit_pct': 0.03,  # 3.0%
+                'min_confidence': 0.6,    # 60%
+                'max_positions': 3,
+                'risk_per_trade': 0.02,   # 2%
+                'use_full_dataset': False
+            },
+            {
+                'name': 'Current Settings (Your Request)',
+                'initial_balance': 500,
+                'leverage': 200,
+                'stop_loss_pct': 0.02,
+                'take_profit_pct': 0.04,
+                'min_confidence': 0.0,   # No confidence filter
+                'max_positions': 1,
+                'risk_per_trade': 0.02,
+                'use_full_dataset': True
+            }
+        ]
+        
+        results = []
+        
+        for config in configurations:
+            print(f"\n{'='*60}")
+            print(f"TESTING: {config['name']}")
+            print(f"{'='*60}")
+            
+            # Choose dataset based on configuration
+            if config['use_full_dataset']:
+                # Use full dataset (like previous report)
+                test_data = self.data.copy()
+                full_predictions = self.model.predict(self.data[self.feature_cols])
+                full_probabilities = self.model.predict_proba(self.data[self.feature_cols])
+                confidence_scores = np.maximum(full_probabilities[:, 0], full_probabilities[:, 1])
+                
+                print(f"Using FULL dataset: {len(test_data)} samples")
+            else:
+                # Use test set only (current approach)
+                X_test = self.data[self.feature_cols].iloc[len(self.X_train):]
+                test_data = self.data.iloc[len(self.X_train):]
+                full_predictions = self.model.predict(X_test)
+                full_probabilities = self.model.predict_proba(X_test)
+                confidence_scores = np.maximum(full_probabilities[:, 0], full_probabilities[:, 1])
+                
+                print(f"Using TEST SET only: {len(test_data)} samples")
+            
+            # Debug information about confidence scores
+            print(f"🔍 Debug Info:")
+            print(f"  - Total samples: {len(full_predictions)}")
+            print(f"  - Buy signals (1): {sum(full_predictions == 1)}")
+            print(f"  - Sell signals (0): {sum(full_predictions == 0)}")
+            print(f"  - Average confidence: {confidence_scores.mean():.3f}")
+            print(f"  - Confidence above 0.6: {sum(confidence_scores > 0.6)}")
+            print(f"  - Confidence above 0.5: {sum(confidence_scores > 0.5)}")
+            
+            # Create new trading strategy instance
+            strategy = TradingStrategy(
+                initial_balance=config['initial_balance'],
+                leverage=config['leverage'],
+                stop_loss_pct=config['stop_loss_pct'],
+                take_profit_pct=config['take_profit_pct'],
+                min_confidence=config['min_confidence'],
+                max_positions=config['max_positions'],
+                risk_per_trade=config['risk_per_trade']
+            )
+            
+            # Execute trading strategy
+            strategy.execute_strategy(test_data, full_predictions, confidence_scores)
+            
+            # Get statistics
+            stats = strategy.get_trade_statistics()
+            
+            if stats:
+                result = {
+                    'config': config['name'],
+                    'initial_balance': config['initial_balance'],
+                    'final_balance': stats['final_balance'],
+                    'total_return': stats['total_return'],
+                    'total_trades': stats['total_trades'],
+                    'win_rate': stats['win_rate'],
+                    'profit_factor': stats['profit_factor'],
+                    'avg_win': stats['average_win'],
+                    'avg_loss': stats['average_loss'],
+                    'max_profit': stats['max_profit'],
+                    'max_loss': stats['max_loss']
+                }
+                results.append(result)
+                
+                print(f"Parameters: SL={config['stop_loss_pct']*100:.1f}%, TP={config['take_profit_pct']*100:.1f}%, Conf={config['min_confidence']*100:.0f}%")
+                print(f"Initial Balance: ${config['initial_balance']:,.2f}")
+                print(f"Final Balance: ${stats['final_balance']:,.2f}")
+                print(f"Total Return: {stats['total_return']:.2f}%")
+                print(f"Total P&L: ${stats['total_pnl']:,.2f}")
+                print(f"Total Trades: {stats['total_trades']}")
+                print(f"Win Rate: {stats['win_rate']:.2f}%")
+                print(f"Profit Factor: {stats['profit_factor']:.2f}")
+                print(f"Average Win: ${stats['average_win']:,.2f}")
+                print(f"Average Loss: ${stats['average_loss']:,.2f}")
+                print(f"Max Profit: ${stats['max_profit']:,.2f}")
+                print(f"Max Loss: ${stats['max_loss']:,.2f}")
+                
+                # Export trades for each configuration
+                filename_csv = f"trades_{config['name'].lower().replace(' ', '_').replace('(', '').replace(')', '')}.csv"
+                filename_xlsx = f"trades_{config['name'].lower().replace(' ', '_').replace('(', '').replace(')', '')}.xlsx"
+                strategy.export_trades_to_csv(filename_csv)
+                strategy.export_trades_to_excel(filename_xlsx)
+        
+        # Summary comparison
+        print(f"\n{'='*140}")
+        print("CONFIGURATION COMPARISON SUMMARY")
+        print(f"{'='*140}")
+        print(f"{'Configuration':<45} {'Initial':<12} {'Final':<12} {'Return %':<10} {'Trades':<8} {'Win %':<8} {'Profit Factor':<12}")
+        print("-" * 140)
+        
+        for result in results:
+            print(f"{result['config']:<45} ${result['initial_balance']:>10,.0f} ${result['final_balance']:>10,.0f} {result['total_return']:>8.2f}% {result['total_trades']:>6} {result['win_rate']:>6.1f}% {result['profit_factor']:>10.2f}")
+        
+        print(f"\n📊 **ANALYSIS:**")
+        print(f"- Previous Report: 2460 trades, 2.99% return with full dataset")
+        print(f"- Current Full Dataset: Check if results now match previous report")
+        print(f"- Test Set Only: Shows why we had fewer trades before")
+        
+        return results
     
     def generate_comprehensive_report(self):
         """Generate a comprehensive analysis report."""
@@ -982,101 +1137,6 @@ Actual    0   {confusion_matrix(self.y_test, self.y_pred)[0,0]}   {confusion_mat
         except Exception as e:
             logger.error(f"Error in complete analysis: {e}")
             return False
-
-    def test_multiple_configurations(self):
-        """Test multiple trading configurations to compare results."""
-        configurations = [
-            {
-                'name': 'Previous Settings (No Leverage)',
-                'initial_balance': 100000,
-                'leverage': 1,
-                'stop_loss_pct': 0.02,
-                'take_profit_pct': 0.04
-            },
-            {
-                'name': 'Current Settings (200x Leverage)',
-                'initial_balance': 500,
-                'leverage': 200,
-                'stop_loss_pct': 0.02,
-                'take_profit_pct': 0.04
-            },
-            {
-                'name': 'Alternative Test (10x Leverage)',
-                'initial_balance': 10000,
-                'leverage': 10,
-                'stop_loss_pct': 0.02,
-                'take_profit_pct': 0.04
-            }
-        ]
-        
-        results = []
-        
-        for config in configurations:
-            print(f"\n{'='*60}")
-            print(f"TESTING: {config['name']}")
-            print(f"{'='*60}")
-            
-            # Create new trading strategy instance
-            strategy = TradingStrategy(
-                initial_balance=config['initial_balance'],
-                leverage=config['leverage'],
-                stop_loss_pct=config['stop_loss_pct'],
-                take_profit_pct=config['take_profit_pct']
-            )
-            
-            # Get predictions for the entire test set
-            X_test = self.data[self.feature_cols].iloc[len(self.X_train):]
-            test_predictions = self.model.predict(X_test)
-            test_data = self.data.iloc[len(self.X_train):]
-            
-            # Execute trading strategy
-            strategy.execute_strategy(test_data, test_predictions)
-            
-            # Get statistics
-            stats = strategy.get_trade_statistics()
-            
-            if stats:
-                result = {
-                    'config': config['name'],
-                    'initial_balance': config['initial_balance'],
-                    'leverage': config['leverage'],
-                    'final_balance': stats['final_balance'],
-                    'total_return': stats['total_return'],
-                    'total_trades': stats['total_trades'],
-                    'win_rate': stats['win_rate'],
-                    'avg_pnl': stats['average_pnl'],
-                    'max_profit': stats['max_profit'],
-                    'max_loss': stats['max_loss']
-                }
-                results.append(result)
-                
-                print(f"Initial Balance: ${config['initial_balance']:,.2f}")
-                print(f"Leverage: {config['leverage']}x")
-                print(f"Final Balance: ${stats['final_balance']:,.2f}")
-                print(f"Total Return: {stats['total_return']:.2f}%")
-                print(f"Total Trades: {stats['total_trades']}")
-                print(f"Win Rate: {stats['win_rate']:.2f}%")
-                print(f"Average P&L per Trade: ${stats['average_pnl']:,.2f}")
-                print(f"Max Profit: ${stats['max_profit']:,.2f}")
-                print(f"Max Loss: ${stats['max_loss']:,.2f}")
-                
-                # Export trades for each configuration
-                filename_csv = f"trades_{config['name'].lower().replace(' ', '_').replace('(', '').replace(')', '')}.csv"
-                filename_xlsx = f"trades_{config['name'].lower().replace(' ', '_').replace('(', '').replace(')', '')}.xlsx"
-                strategy.export_trades_to_csv(filename_csv)
-                strategy.export_trades_to_excel(filename_xlsx)
-        
-        # Summary comparison
-        print(f"\n{'='*80}")
-        print("CONFIGURATION COMPARISON SUMMARY")
-        print(f"{'='*80}")
-        print(f"{'Configuration':<30} {'Initial':<12} {'Leverage':<10} {'Final Balance':<18} {'Return %':<12}")
-        print("-" * 80)
-        
-        for result in results:
-            print(f"{result['config']:<30} ${result['initial_balance']:>10,.0f} {result['leverage']:>8}x ${result['final_balance']:>15,.2f} {result['total_return']:>10.2f}%")
-        
-        return results
 
 def main():
     """Main execution function."""

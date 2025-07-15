@@ -31,6 +31,228 @@ except ImportError:
     subprocess.run(['pip', 'install', 'openpyxl'], check=True)
     import openpyxl
 
+class ConservativeTradingStrategy:
+    """Conservative trading strategy with simple position sizing and no leverage."""
+    
+    def __init__(self, initial_balance=5000, leverage=1, stop_loss_pct=0.02, take_profit_pct=0.06, 
+                 min_confidence=0.0, max_positions=1, risk_per_trade=0.02, fixed_quantity=True):
+        self.initial_balance = initial_balance
+        self.leverage = leverage  # Always 1 for conservative strategy
+        self.stop_loss_pct = stop_loss_pct
+        self.take_profit_pct = take_profit_pct
+        self.min_confidence = min_confidence
+        self.max_positions = max_positions  # Always 1 for conservative strategy
+        self.risk_per_trade = risk_per_trade
+        self.fixed_quantity = fixed_quantity
+        self.balance = initial_balance
+        self.trades = []
+        self.position = None  # Single position only
+        
+    def execute_strategy(self, data, predictions, confidence_scores=None):
+        """Execute conservative trading strategy with simple position sizing."""
+        self.trades = []
+        self.balance = self.initial_balance
+        self.position = None
+        
+        for i in range(len(data)):
+            if i < len(predictions):
+                current_price = data.iloc[i]['close']
+                current_date = data.index[i] if hasattr(data.index, '__getitem__') else i
+                
+                # Check stop loss/take profit for current position
+                if self.position:
+                    self.check_stop_loss_take_profit(current_price, current_date)
+                
+                # Get confidence score if available
+                confidence = None
+                if confidence_scores is not None and i < len(confidence_scores):
+                    confidence = confidence_scores[i]
+                
+                # Try to open new position if none exists
+                if not self.position:
+                    signal = predictions[i]
+                    self.open_position(signal, current_price, current_date, confidence)
+        
+        # Close any remaining position at the end
+        if self.position:
+            final_price = data.iloc[-1]['close']
+            final_date = data.index[-1] if hasattr(data.index, '__getitem__') else len(data)-1
+            self.close_position(final_price, final_date, 'end_of_data')
+    
+    def open_position(self, signal, price, date, confidence=None):
+        """Open a new position with simple position sizing."""
+        # Check confidence filter
+        if confidence is not None and confidence < self.min_confidence:
+            return
+        
+        # Check if we already have a position
+        if self.position:
+            return
+        
+        # Check if we have enough balance
+        if self.balance <= 0:
+            return
+        
+        # Determine position type
+        if signal == 1:  # Buy signal
+            position_type = 'long'
+        else:  # Sell signal
+            position_type = 'short'
+        
+        # Simple position sizing: Risk a fixed percentage of balance
+        risk_amount = self.balance * self.risk_per_trade
+        
+        # Calculate position size based on stop loss distance
+        stop_loss_distance = price * self.stop_loss_pct
+        if stop_loss_distance > 0:
+            # Position size = Risk amount / Stop loss distance
+            position_size = risk_amount / stop_loss_distance
+        else:
+            # Fallback: Risk 2% of balance
+            position_size = risk_amount / price
+        
+        # Ensure we don't exceed available balance
+        position_value = position_size * price
+        if position_value > self.balance:
+            position_size = self.balance / price
+        
+        if position_size > 0:
+            # Create position
+            self.position = {
+                'type': position_type,
+                'size': position_size,
+                'entry_price': price,
+                'entry_date': date,
+                'stop_loss': price * (1 - self.stop_loss_pct) if position_type == 'long' else price * (1 + self.stop_loss_pct),
+                'take_profit': price * (1 + self.take_profit_pct) if position_type == 'long' else price * (1 - self.take_profit_pct),
+                'confidence': confidence
+            }
+            
+            # Deduct position value from balance (since no leverage)
+            self.balance -= position_value
+    
+    def close_position(self, exit_price, exit_date, exit_reason):
+        """Close the current position."""
+        if not self.position:
+            return
+        
+        # Calculate P&L
+        if self.position['type'] == 'long':
+            pnl = (exit_price - self.position['entry_price']) * self.position['size']
+        else:  # short
+            pnl = (self.position['entry_price'] - exit_price) * self.position['size']
+        
+        # Calculate return percentage
+        position_value = self.position['size'] * self.position['entry_price']
+        return_pct = (pnl / position_value) * 100 if position_value > 0 else 0
+        
+        # Create trade record
+        trade = {
+            'type': self.position['type'],
+            'size': self.position['size'],
+            'entry_price': self.position['entry_price'],
+            'entry_date': self.position['entry_date'],
+            'exit_price': exit_price,
+            'exit_date': exit_date,
+            'exit_reason': exit_reason,
+            'pnl': pnl,
+            'return_pct': return_pct,
+            'confidence': self.position.get('confidence', 0),
+            'position_value': position_value
+        }
+        
+        self.trades.append(trade)
+        
+        # Update balance
+        self.balance += position_value + pnl
+        
+        # Clear position
+        self.position = None
+    
+    def check_stop_loss_take_profit(self, current_price, current_date):
+        """Check if position should be closed due to stop loss or take profit."""
+        if not self.position:
+            return
+        
+        if self.position['type'] == 'long':
+            # Long position checks
+            if current_price <= self.position['stop_loss']:
+                self.close_position(current_price, current_date, 'stop_loss')
+            elif current_price >= self.position['take_profit']:
+                self.close_position(current_price, current_date, 'take_profit')
+        else:  # short position
+            # Short position checks
+            if current_price >= self.position['stop_loss']:
+                self.close_position(current_price, current_date, 'stop_loss')
+            elif current_price <= self.position['take_profit']:
+                self.close_position(current_price, current_date, 'take_profit')
+    
+    def get_trade_statistics(self):
+        """Calculate trading statistics."""
+        if not self.trades:
+            return {}
+        
+        df_trades = pd.DataFrame(self.trades)
+        
+        winning_trades = df_trades[df_trades['pnl'] > 0]
+        losing_trades = df_trades[df_trades['pnl'] <= 0]
+        
+        avg_win = winning_trades['pnl'].mean() if len(winning_trades) > 0 else 0
+        avg_loss = losing_trades['pnl'].mean() if len(losing_trades) > 0 else 0
+        
+        # Calculate profit factor
+        total_wins = winning_trades['pnl'].sum() if len(winning_trades) > 0 else 0
+        total_losses = abs(losing_trades['pnl'].sum()) if len(losing_trades) > 0 else 1
+        profit_factor = total_wins / total_losses if total_losses > 0 else 0
+        
+        stats = {
+            'total_trades': len(self.trades),
+            'winning_trades': len(winning_trades),
+            'losing_trades': len(losing_trades),
+            'win_rate': len(winning_trades) / len(self.trades) * 100,
+            'total_pnl': df_trades['pnl'].sum(),
+            'average_pnl': df_trades['pnl'].mean(),
+            'average_win': avg_win,
+            'average_loss': avg_loss,
+            'max_profit': df_trades['pnl'].max(),
+            'max_loss': df_trades['pnl'].min(),
+            'final_balance': self.balance,
+            'total_return': ((self.balance - self.initial_balance) / self.initial_balance) * 100,
+            'profit_factor': profit_factor
+        }
+        
+        return stats
+    
+    def export_trades_to_csv(self, filename='conservative_trades.csv'):
+        """Export all trades to CSV file."""
+        if not self.trades:
+            print("No trades to export")
+            return
+        
+        df_trades = pd.DataFrame(self.trades)
+        df_trades.to_csv(filename, index=False)
+        print(f"Conservative trades exported to {filename}")
+    
+    def export_trades_to_excel(self, filename='conservative_trades.xlsx'):
+        """Export all trades to Excel file."""
+        if not self.trades:
+            print("No trades to export")
+            return
+        
+        df_trades = pd.DataFrame(self.trades)
+        
+        # Create Excel writer
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            # Write trades to one sheet
+            df_trades.to_excel(writer, sheet_name='Trades', index=False)
+            
+            # Write statistics to another sheet
+            stats = self.get_trade_statistics()
+            stats_df = pd.DataFrame(list(stats.items()), columns=['Metric', 'Value'])
+            stats_df.to_excel(writer, sheet_name='Statistics', index=False)
+        
+        print(f"Conservative trades exported to {filename}")
+
 class TradingStrategy:
     """Trading strategy class with configurable parameters."""
     
@@ -1452,19 +1674,224 @@ Actual    0   {confusion_matrix(self.y_test, self.y_pred)[0,0]}   {confusion_mat
             logger.error(f"Error in complete analysis: {e}")
             return False
 
+    def create_conservative_high_performance_strategy(self):
+        """Create conservative strategy with $5,000 capital, no leverage, simple position sizing."""
+        configurations = [
+            {
+                'name': 'CONSERVATIVE HIGH SHARPE STRATEGY',
+                'initial_balance': 5000,
+                'leverage': 1,            # No leverage
+                'stop_loss_pct': 0.02,    # 2% stop loss
+                'take_profit_pct': 0.06,  # 6% take profit (3:1 risk-reward)
+                'min_confidence': 0.0,    # No filters
+                'max_positions': 1,       # One position at a time
+                'risk_per_trade': 0.02,   # 2% risk per trade
+                'use_full_dataset': True,
+                'fixed_quantity': True    # Use fixed quantity per trade
+            },
+            {
+                'name': 'CONSERVATIVE LOW DRAWDOWN STRATEGY',
+                'initial_balance': 5000,
+                'leverage': 1,            # No leverage
+                'stop_loss_pct': 0.015,   # 1.5% stop loss
+                'take_profit_pct': 0.06,  # 6% take profit (4:1 risk-reward)
+                'min_confidence': 0.0,    # No filters
+                'max_positions': 1,       # One position at a time
+                'risk_per_trade': 0.015,  # 1.5% risk per trade
+                'use_full_dataset': True,
+                'fixed_quantity': True
+            },
+            {
+                'name': 'CONSERVATIVE PROFIT FACTOR 2+ STRATEGY',
+                'initial_balance': 5000,
+                'leverage': 1,            # No leverage
+                'stop_loss_pct': 0.01,    # 1% stop loss
+                'take_profit_pct': 0.04,  # 4% take profit (4:1 risk-reward)
+                'min_confidence': 0.0,    # No filters
+                'max_positions': 1,       # One position at a time
+                'risk_per_trade': 0.01,   # 1% risk per trade
+                'use_full_dataset': True,
+                'fixed_quantity': True
+            },
+            {
+                'name': 'CONSERVATIVE MAXIMUM TRADES STRATEGY',
+                'initial_balance': 5000,
+                'leverage': 1,            # No leverage
+                'stop_loss_pct': 0.005,   # 0.5% stop loss
+                'take_profit_pct': 0.015, # 1.5% take profit (3:1 risk-reward)
+                'min_confidence': 0.0,    # No filters
+                'max_positions': 1,       # One position at a time
+                'risk_per_trade': 0.005,  # 0.5% risk per trade
+                'use_full_dataset': True,
+                'fixed_quantity': True
+            }
+        ]
+        
+        best_strategies = []
+        
+        for config in configurations:
+            print(f"\n🚀 Testing {config['name']}...")
+            
+            # Create conservative strategy
+            strategy = ConservativeTradingStrategy(
+                initial_balance=config['initial_balance'],
+                leverage=config['leverage'],
+                stop_loss_pct=config['stop_loss_pct'],
+                take_profit_pct=config['take_profit_pct'],
+                min_confidence=config['min_confidence'],
+                max_positions=config['max_positions'],
+                risk_per_trade=config['risk_per_trade'],
+                fixed_quantity=config.get('fixed_quantity', True)
+            )
+            
+            # Execute strategy on full dataset
+            full_data = self.data.copy()
+            full_predictions = self.model.predict(full_data[self.feature_cols])
+            full_probabilities = self.model.predict_proba(full_data[self.feature_cols])
+            confidence_scores = np.maximum(full_probabilities[:, 0], full_probabilities[:, 1])
+            
+            strategy.execute_strategy(full_data, full_predictions, confidence_scores)
+            
+            # Get enhanced statistics
+            stats = strategy.get_trade_statistics()
+            
+            if stats and stats['total_trades'] > 0:
+                # Calculate advanced metrics
+                df_trades = pd.DataFrame(strategy.trades)
+                
+                # Calculate Sharpe ratio
+                if len(df_trades) > 1:
+                    returns = df_trades['return_pct'].dropna() / 100  # Convert to decimal
+                    if len(returns) > 0 and returns.std() > 0:
+                        sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(252)
+                    else:
+                        sharpe_ratio = 0
+                else:
+                    sharpe_ratio = 0
+                
+                # Calculate drawdown
+                df_trades = df_trades.sort_values('exit_date')
+                df_trades['cumulative_pnl'] = df_trades['pnl'].cumsum()
+                running_max = df_trades['cumulative_pnl'].expanding().max()
+                drawdown = (df_trades['cumulative_pnl'] - running_max) / (config['initial_balance'] + running_max)
+                max_drawdown = drawdown.min() * 100
+                
+                # Enhanced results
+                result = {
+                    'config': config['name'],
+                    'total_trades': stats['total_trades'],
+                    'win_rate': stats['win_rate'],
+                    'total_return': stats['total_return'],
+                    'final_balance': stats['final_balance'],
+                    'profit_factor': stats['profit_factor'],
+                    'sharpe_ratio': sharpe_ratio,
+                    'max_drawdown': max_drawdown,
+                    'avg_win': stats['average_win'],
+                    'avg_loss': stats['average_loss'],
+                    'max_profit': stats['max_profit'],
+                    'max_loss': stats['max_loss'],
+                    'total_pnl': stats['total_pnl']
+                }
+                
+                best_strategies.append(result)
+                
+                # Print detailed results
+                print(f"📊 CONSERVATIVE STRATEGY RESULTS:")
+                print(f"  💰 Initial Balance: ${config['initial_balance']:,.2f}")
+                print(f"  🔄 Leverage: {config['leverage']}x (No leverage)")
+                print(f"  🎯 Total Trades: {stats['total_trades']}")
+                print(f"  🏆 Win Rate: {stats['win_rate']:.2f}%")
+                print(f"  📈 Total Return: {stats['total_return']:.2f}%")
+                print(f"  💵 Final Balance: ${stats['final_balance']:,.2f}")
+                print(f"  💎 Total P&L: ${stats['total_pnl']:,.2f}")
+                print(f"  ⚡ Profit Factor: {stats['profit_factor']:.2f} {'✅' if stats['profit_factor'] >= 2.0 else '❌'}")
+                print(f"  📊 Sharpe Ratio: {sharpe_ratio:.2f}")
+                print(f"  📉 Max Drawdown: {max_drawdown:.2f}%")
+                print(f"  🎪 Average Win: ${stats['average_win']:.2f}")
+                print(f"  ⚠️ Average Loss: ${stats['average_loss']:.2f}")
+                print(f"  🚀 Max Profit: ${stats['max_profit']:.2f}")
+                print(f"  🔻 Max Loss: ${stats['max_loss']:.2f}")
+                
+                # Performance analysis
+                print(f"  🎯 PERFORMANCE ANALYSIS:")
+                print(f"    - Sharpe Ratio: {sharpe_ratio:.2f} {'✅ EXCELLENT' if sharpe_ratio >= 2.0 else '✅ GOOD' if sharpe_ratio >= 1.0 else '⚠️ NEEDS IMPROVEMENT'}")
+                print(f"    - Max Drawdown: {max_drawdown:.2f}% {'✅ EXCELLENT' if max_drawdown >= -5 else '✅ GOOD' if max_drawdown >= -10 else '⚠️ HIGH'}")
+                print(f"    - Profit Factor: {stats['profit_factor']:.2f} {'✅ TARGET ACHIEVED' if stats['profit_factor'] >= 2.0 else '⚠️ BELOW TARGET'}")
+                print(f"    - Trade Volume: {stats['total_trades']} {'✅ HIGH' if stats['total_trades'] >= 1000 else '✅ MODERATE' if stats['total_trades'] >= 500 else '⚠️ LOW'}")
+                
+                # Export trades
+                safe_name = config['name'].lower().replace(' ', '_')
+                csv_filename = f"conservative_{safe_name}.csv"
+                xlsx_filename = f"conservative_{safe_name}.xlsx"
+                
+                strategy.export_trades_to_csv(csv_filename)
+                strategy.export_trades_to_excel(xlsx_filename)
+                print(f"  📁 Exported: {csv_filename} and {xlsx_filename}")
+        
+        # Summary comparison
+        if best_strategies:
+            print(f"\n🏆 CONSERVATIVE STRATEGY COMPARISON:")
+            print(f"{'Strategy':<40} {'Trades':<8} {'Win Rate':<10} {'Return':<12} {'P&L':<12} {'Profit Factor':<12} {'Sharpe':<8} {'Drawdown':<10}")
+            print("-" * 130)
+            
+            for result in best_strategies:
+                print(f"{result['config']:<40} {result['total_trades']:<8} {result['win_rate']:<10.2f}% {result['total_return']:<12.2f}% ${result['total_pnl']:<11.2f} {result['profit_factor']:<12.2f} {result['sharpe_ratio']:<8.2f} {result['max_drawdown']:<10.2f}%")
+            
+            # Find best performers
+            best_sharpe = max(best_strategies, key=lambda x: x['sharpe_ratio'])
+            best_drawdown = max(best_strategies, key=lambda x: x['max_drawdown'])
+            best_profit_factor = max(best_strategies, key=lambda x: x['profit_factor'])
+            most_trades = max(best_strategies, key=lambda x: x['total_trades'])
+            best_return = max(best_strategies, key=lambda x: x['total_return'])
+            
+            print(f"\n🎯 BEST PERFORMERS BY CATEGORY:")
+            print(f"  📊 Best Sharpe Ratio: {best_sharpe['config']} ({best_sharpe['sharpe_ratio']:.2f})")
+            print(f"  📉 Best Drawdown: {best_drawdown['config']} ({best_drawdown['max_drawdown']:.2f}%)")
+            print(f"  ⚡ Best Profit Factor: {best_profit_factor['config']} ({best_profit_factor['profit_factor']:.2f})")
+            print(f"  🔥 Most Trades: {most_trades['config']} ({most_trades['total_trades']} trades)")
+            print(f"  💰 Best Return: {best_return['config']} ({best_return['total_return']:.2f}%)")
+            
+            # Overall winner based on balanced scoring
+            for result in best_strategies:
+                # Balanced scoring: Sharpe (30%) + Profit Factor (30%) + Drawdown (20%) + Return (20%)
+                sharpe_score = min(max(result['sharpe_ratio'], 0) / 3, 1)
+                profit_score = min(result['profit_factor'] / 3, 1)
+                drawdown_score = max(0, 20 + result['max_drawdown']) / 20
+                return_score = min(result['total_return'] / 100, 1)
+                
+                result['composite_score'] = (sharpe_score * 0.3) + (profit_score * 0.3) + (drawdown_score * 0.2) + (return_score * 0.2)
+            
+            overall_winner = max(best_strategies, key=lambda x: x['composite_score'])
+            print(f"\n🏆 OVERALL WINNER: {overall_winner['config']}")
+            print(f"  📊 Composite Score: {overall_winner['composite_score']:.3f}")
+            print(f"  🎯 Total Trades: {overall_winner['total_trades']}")
+            print(f"  🏆 Win Rate: {overall_winner['win_rate']:.2f}%")
+            print(f"  💰 Total Return: {overall_winner['total_return']:.2f}%")
+            print(f"  💎 Total P&L: ${overall_winner['total_pnl']:,.2f}")
+            print(f"  ⚡ Profit Factor: {overall_winner['profit_factor']:.2f}")
+            print(f"  📊 Sharpe Ratio: {overall_winner['sharpe_ratio']:.2f}")
+            print(f"  📉 Max Drawdown: {overall_winner['max_drawdown']:.2f}%")
+        
+        return best_strategies
+
 def main():
-    """Main execution function with high-performance strategy optimization."""
+    """Main execution function with conservative high-performance strategy."""
     try:
         # Initialize and run the enhanced model
         model = RobustXAUUSDModel('XAU_1d_data_clean.csv')
         
-        # Run the enhanced analysis
-        print("🚀 Starting HIGH-PERFORMANCE XAUUSD Trading Strategy...")
+        # Run the conservative analysis
+        print("🚀 Starting CONSERVATIVE HIGH-PERFORMANCE XAUUSD Trading Strategy...")
+        print("💼 CONSERVATIVE PARAMETERS:")
+        print("   - Initial Capital: $5,000")
+        print("   - Leverage: 1x (No leverage)")
+        print("   - Position Sizing: Simple risk-based sizing")
+        print("   - Max Positions: 1 (One position at a time)")
         print("🎯 TARGET METRICS:")
         print("   - HIGH SHARPE RATIO (Risk-adjusted returns)")
         print("   - LOWEST DRAWDOWN (Minimal losses)")
         print("   - PROFIT FACTOR ABOVE 2.0 (Wins 2x larger than losses)")
-        print("   - MAXIMUM TRADE VOLUME (24,000+ trades like previous)")
+        print("   - MAXIMUM TRADE VOLUME (High frequency trading)")
         
         # Step 1: Load and validate data
         if not model.load_and_validate_data():
@@ -1486,27 +1913,38 @@ def main():
             return
         print("✅ Enhanced model trained and optimized")
         
-        # Step 5: Create HIGH-PERFORMANCE strategies
-        print("\n🎯 CREATING HIGH-PERFORMANCE STRATEGIES...")
-        best_strategies = model.create_high_performance_strategy()
+        # Step 5: Create CONSERVATIVE HIGH-PERFORMANCE strategies
+        print("\n🎯 CREATING CONSERVATIVE HIGH-PERFORMANCE STRATEGIES...")
+        best_strategies = model.create_conservative_high_performance_strategy()
         
-        print("\n✅ High-performance analysis completed successfully!")
+        print("\n✅ Conservative analysis completed successfully!")
         print("\n📊 FINAL SUMMARY:")
-        print("   - Multiple strategies tested for optimal performance")
+        print("   - Conservative approach with $5,000 initial capital")
+        print("   - No leverage (1x) for realistic trading")
+        print("   - Simple position sizing (one quantity per trade)")
         print("   - Focus on Sharpe ratio, drawdown, and profit factor")
-        print("   - Maximum trade volume generation")
         print("   - Complete dataset utilization (5,391 samples)")
-        print("   - Advanced risk management and position sizing")
+        print("   - Advanced risk management")
         
         if best_strategies:
             # Find the best overall performer
             best_overall = max(best_strategies, key=lambda x: x.get('composite_score', 0))
-            print(f"\n🏆 RECOMMENDED STRATEGY: {best_overall['config']}")
+            print(f"\n🏆 RECOMMENDED CONSERVATIVE STRATEGY: {best_overall['config']}")
+            print(f"   📊 Composite Score: {best_overall['composite_score']:.3f}")
+            print(f"   🎯 Total Trades: {best_overall['total_trades']}")
+            print(f"   🏆 Win Rate: {best_overall['win_rate']:.2f}%")
+            print(f"   💰 Total Return: {best_overall['total_return']:.2f}%")
+            print(f"   💎 Total P&L: ${best_overall['total_pnl']:,.2f}")
+            print(f"   ⚡ Profit Factor: {best_overall['profit_factor']:.2f}")
             print(f"   📊 Sharpe Ratio: {best_overall['sharpe_ratio']:.2f}")
             print(f"   📉 Max Drawdown: {best_overall['max_drawdown']:.2f}%")
-            print(f"   ⚡ Profit Factor: {best_overall['profit_factor']:.2f}")
-            print(f"   🎯 Total Trades: {best_overall['total_trades']}")
-            print(f"   💰 Total Return: {best_overall['total_return']:.2f}%")
+            
+            # Show all trade files generated
+            print(f"\n📁 TRADE FILES GENERATED:")
+            print(f"   - conservative_high_sharpe_strategy.csv/xlsx")
+            print(f"   - conservative_low_drawdown_strategy.csv/xlsx")
+            print(f"   - conservative_profit_factor_2+_strategy.csv/xlsx")
+            print(f"   - conservative_maximum_trades_strategy.csv/xlsx")
         
     except Exception as e:
         logger.error(f"Error in main execution: {e}")

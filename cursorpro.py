@@ -48,7 +48,13 @@ class TradingStrategy:
         
     def calculate_position_size(self, price):
         """Calculate position size based on balance and leverage."""
-        return (self.balance * self.leverage) / price
+        if self.leverage == 1:
+            # No leverage - use available balance directly
+            return self.balance / price
+        else:
+            # With leverage - use a percentage of balance to avoid excessive risk
+            risk_per_trade = min(self.balance * 0.02, self.balance)  # Risk max 2% of balance per trade
+            return (risk_per_trade * self.leverage) / price
         
     def open_position(self, signal, price, date):
         """Open a new position based on signal."""
@@ -73,9 +79,27 @@ class TradingStrategy:
             return
             
         if self.position == 'long':
-            pnl = (price - self.entry_price) * self.position_size
+            if self.leverage == 1:
+                # No leverage - simple calculation
+                pnl = (price - self.entry_price) * self.position_size
+            else:
+                # With leverage - calculate based on price change percentage
+                price_change_pct = (price - self.entry_price) / self.entry_price
+                risk_amount = min(self.balance * 0.02, self.balance)  # Max 2% risk per trade
+                pnl = risk_amount * price_change_pct * self.leverage
         else:  # short
-            pnl = (self.entry_price - price) * self.position_size
+            if self.leverage == 1:
+                # No leverage - simple calculation
+                pnl = (self.entry_price - price) * self.position_size
+            else:
+                # With leverage - calculate based on price change percentage
+                price_change_pct = (self.entry_price - price) / self.entry_price
+                risk_amount = min(self.balance * 0.02, self.balance)  # Max 2% risk per trade
+                pnl = risk_amount * price_change_pct * self.leverage
+        
+        # Prevent balance from going negative
+        if self.balance + pnl < 0:
+            pnl = -self.balance + 1  # Leave $1 to continue trading
             
         self.balance += pnl
         
@@ -959,20 +983,140 @@ Actual    0   {confusion_matrix(self.y_test, self.y_pred)[0,0]}   {confusion_mat
             logger.error(f"Error in complete analysis: {e}")
             return False
 
+    def test_multiple_configurations(self):
+        """Test multiple trading configurations to compare results."""
+        configurations = [
+            {
+                'name': 'Previous Settings (No Leverage)',
+                'initial_balance': 100000,
+                'leverage': 1,
+                'stop_loss_pct': 0.02,
+                'take_profit_pct': 0.04
+            },
+            {
+                'name': 'Current Settings (200x Leverage)',
+                'initial_balance': 500,
+                'leverage': 200,
+                'stop_loss_pct': 0.02,
+                'take_profit_pct': 0.04
+            },
+            {
+                'name': 'Alternative Test (10x Leverage)',
+                'initial_balance': 10000,
+                'leverage': 10,
+                'stop_loss_pct': 0.02,
+                'take_profit_pct': 0.04
+            }
+        ]
+        
+        results = []
+        
+        for config in configurations:
+            print(f"\n{'='*60}")
+            print(f"TESTING: {config['name']}")
+            print(f"{'='*60}")
+            
+            # Create new trading strategy instance
+            strategy = TradingStrategy(
+                initial_balance=config['initial_balance'],
+                leverage=config['leverage'],
+                stop_loss_pct=config['stop_loss_pct'],
+                take_profit_pct=config['take_profit_pct']
+            )
+            
+            # Get predictions for the entire test set
+            X_test = self.data[self.feature_cols].iloc[len(self.X_train):]
+            test_predictions = self.model.predict(X_test)
+            test_data = self.data.iloc[len(self.X_train):]
+            
+            # Execute trading strategy
+            strategy.execute_strategy(test_data, test_predictions)
+            
+            # Get statistics
+            stats = strategy.get_trade_statistics()
+            
+            if stats:
+                result = {
+                    'config': config['name'],
+                    'initial_balance': config['initial_balance'],
+                    'leverage': config['leverage'],
+                    'final_balance': stats['final_balance'],
+                    'total_return': stats['total_return'],
+                    'total_trades': stats['total_trades'],
+                    'win_rate': stats['win_rate'],
+                    'avg_pnl': stats['average_pnl'],
+                    'max_profit': stats['max_profit'],
+                    'max_loss': stats['max_loss']
+                }
+                results.append(result)
+                
+                print(f"Initial Balance: ${config['initial_balance']:,.2f}")
+                print(f"Leverage: {config['leverage']}x")
+                print(f"Final Balance: ${stats['final_balance']:,.2f}")
+                print(f"Total Return: {stats['total_return']:.2f}%")
+                print(f"Total Trades: {stats['total_trades']}")
+                print(f"Win Rate: {stats['win_rate']:.2f}%")
+                print(f"Average P&L per Trade: ${stats['average_pnl']:,.2f}")
+                print(f"Max Profit: ${stats['max_profit']:,.2f}")
+                print(f"Max Loss: ${stats['max_loss']:,.2f}")
+                
+                # Export trades for each configuration
+                filename_csv = f"trades_{config['name'].lower().replace(' ', '_').replace('(', '').replace(')', '')}.csv"
+                filename_xlsx = f"trades_{config['name'].lower().replace(' ', '_').replace('(', '').replace(')', '')}.xlsx"
+                strategy.export_trades_to_csv(filename_csv)
+                strategy.export_trades_to_excel(filename_xlsx)
+        
+        # Summary comparison
+        print(f"\n{'='*80}")
+        print("CONFIGURATION COMPARISON SUMMARY")
+        print(f"{'='*80}")
+        print(f"{'Configuration':<30} {'Initial':<12} {'Leverage':<10} {'Final Balance':<18} {'Return %':<12}")
+        print("-" * 80)
+        
+        for result in results:
+            print(f"{result['config']:<30} ${result['initial_balance']:>10,.0f} {result['leverage']:>8}x ${result['final_balance']:>15,.2f} {result['total_return']:>10.2f}%")
+        
+        return results
+
 def main():
     """Main execution function."""
     try:
         # Initialize and run the model
         model = RobustXAUUSDModel('XAU_1d_data_clean.csv')
-        success = model.run_complete_analysis()
         
-        if success:
-            print("\n?? Model pipeline completed successfully!")
-        else:
-            print("\n? Model pipeline failed. Check logs for details.")
+        # Run the basic analysis first
+        print("🚀 Starting XAUUSD ML Analysis Pipeline...")
+        
+        # Step 1: Load and validate data
+        if not model.load_and_validate_data():
+            return
+        print("✅ Data loaded and validated")
+        
+        # Step 2: Feature engineering
+        if not model.prepare_features():
+            return
+        print("✅ Features engineered")
+        
+        # Step 3: Create target
+        if not model.create_target():
+            return
+        print("✅ Target variable created")
+        
+        # Step 4: Train model
+        if not model.train_model():
+            return
+        print("✅ Model trained and evaluated")
+        
+        # Step 5: Test multiple configurations to compare results
+        print("\n🔍 TESTING MULTIPLE CONFIGURATIONS TO COMPARE RESULTS...")
+        model.test_multiple_configurations()
+        
+        print("\n✅ Configuration comparison completed!")
+        print("\nThis analysis shows why results differ from previous runs.")
+        print("Check the generated trade files for each configuration.")
             
     except Exception as e:
-        print(f"? Fatal error: {e}")
+        print(f"❌ Fatal error: {e}")
         logger.error(f"Fatal error in main: {e}")
 
 if __name__ == "__main__":
